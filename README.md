@@ -129,13 +129,19 @@ Polaris is a browser-based IDE inspired by Cursor AI, featuring:
    npm run dev
    ```
 
-7. In another terminal, start the Inngest dev server:
+ 7. In another terminal, start the Inngest dev server (for background job processing):
 
-   ```bash
-   npx inngest-cli@latest dev
-   ```
+    ```bash
+    npm run dev:inngest
+    ```
 
-8. Open [http://localhost:3000](http://localhost:3000)
+ 8. Or if you prefer using the Inngest CLI directly:
+
+    ```bash
+    npx inngest-cli@latest dev --url=http://localhost:3000/api/inngest
+    ```
+
+ 8. Open [http://localhost:3000](http://localhost:3000)
 
 ## Project Structure
 

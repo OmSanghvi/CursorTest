@@ -1,12 +1,73 @@
-import { createAgent, anthropic, createNetwork } from '@inngest/agent-kit';
+import { createAgent, createNetwork, openai } from '@inngest/agent-kit';
+
+// Custom Groq model wrapper for agent-kit using OpenAI adapter
+const createGroqModel = (modelName: string, defaultParams?: any) => {
+  console.log("[createGroqModel] Creating Groq model with:", {
+    modelName,
+    apiKeyPresent: !!process.env.GROQ_API_KEY,
+  });
+  
+  try {
+    const model = openai({
+      model: modelName,
+      apiKey: process.env.GROQ_API_KEY,
+      baseUrl: 'https://api.groq.com/openai/v1',
+      defaultParameters: {
+        temperature: defaultParams?.temperature ?? 0.6,
+        max_completion_tokens: defaultParams?.max_tokens ?? 4096,
+      },
+      // Add retry mechanism for rate limits
+      ...(process.env.GROQ_API_KEY && {
+        fetch: async (url: string, init: RequestInit) => {
+          let lastError: Error | null = null;
+          const maxRetries = 3;
+          const baseDelay = 1000; // 1 second
+
+          for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+              const response = await fetch(url, init);
+              
+              if (response.status === 429) {
+                lastError = new Error(`Rate limited, retrying... (attempt ${attempt + 1}/${maxRetries + 1})`);
+                if (attempt < maxRetries) {
+                  const delay = baseDelay * Math.pow(2, attempt); // Exponential backoff
+                  console.log(`[groq] Rate limited, waiting ${delay}ms before retry...`);
+                  await new Promise(resolve => setTimeout(resolve, delay));
+                  continue;
+                }
+              }
+              
+              return response;
+            } catch (error) {
+              lastError = error instanceof Error ? error : new Error(String(error));
+              if (attempt < maxRetries) {
+                const delay = baseDelay * Math.pow(2, attempt);
+                console.log(`[groq] Request failed, retrying in ${delay}ms...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+              }
+            }
+          }
+          
+          throw lastError || new Error('Unknown error');
+        },
+      }),
+    });
+    
+    console.log("[createGroqModel] Model created successfully");
+    return model;
+  } catch (error) {
+    console.error("[createGroqModel] Error creating model:", error);
+    throw error;
+  }
+};
 
 import { inngest } from "@/inngest/client";
 import { Id } from "../../../../convex/_generated/dataModel";
 import { NonRetriableError } from "inngest";
 import { convex } from "@/lib/convex-client";
 import { api } from "../../../../convex/_generated/api";
-import { 
-  CODING_AGENT_SYSTEM_PROMPT, 
+import {
+  CODING_AGENT_SYSTEM_PROMPT,
   TITLE_GENERATOR_SYSTEM_PROMPT
 } from "./constants";
 import { DEFAULT_CONVERSATION_TITLE } from "../constants";
@@ -24,7 +85,7 @@ interface MessageEvent {
   conversationId: Id<"conversations">;
   projectId: Id<"projects">;
   message: string;
-};
+}
 
 export const processMessage = inngest.createFunction(
   {
@@ -39,7 +100,6 @@ export const processMessage = inngest.createFunction(
       const { messageId } = event.data.event.data as MessageEvent;
       const internalKey = process.env.POLARIS_CONVEX_INTERNAL_KEY;
 
-      // Update the message with error content
       if (internalKey) {
         await step.run("update-message-on-failure", async () => {
           await convex.mutation(api.system.updateMessageContent, {
@@ -50,26 +110,25 @@ export const processMessage = inngest.createFunction(
           });
         });
       }
-    }
+    },
   },
   {
     event: "message/sent",
   },
   async ({ event, step }) => {
-    const { 
-      messageId, 
+    const {
+      messageId,
       conversationId,
       projectId,
-      message
+      message,
     } = event.data as MessageEvent;
 
-    const internalKey = process.env.POLARIS_CONVEX_INTERNAL_KEY; 
+    const internalKey = process.env.POLARIS_CONVEX_INTERNAL_KEY;
 
     if (!internalKey) {
       throw new NonRetriableError("POLARIS_CONVEX_INTERNAL_KEY is not configured");
     }
 
-    // TODO: Check if this is needed
     await step.sleep("wait-for-db-sync", "1s");
 
     // Get conversation for title generation check
@@ -96,7 +155,6 @@ export const processMessage = inngest.createFunction(
     // Build system prompt with conversation history (exclude the current processing message)
     let systemPrompt = CODING_AGENT_SYSTEM_PROMPT;
 
-    // Filter out the current processing message and empty messages
     const contextMessages = recentMessages.filter(
       (msg) => msg._id !== messageId && msg.content.trim() !== ""
     );
@@ -110,33 +168,26 @@ export const processMessage = inngest.createFunction(
     }
 
     // Generate conversation title if it's still the default
-    const shouldGenerateTitle =
-      conversation.title === DEFAULT_CONVERSATION_TITLE;
+    const shouldGenerateTitle = conversation.title === DEFAULT_CONVERSATION_TITLE;
 
     if (shouldGenerateTitle) {
-       const titleAgent = createAgent({
+      const titleAgent = createAgent({
         name: "title-generator",
         system: TITLE_GENERATOR_SYSTEM_PROMPT,
-        model: anthropic({
-          model: "claude-3-5-haiku-20241022",
-          defaultParameters: { temperature: 0, max_tokens: 50 },
-        }),
-       });
+        model: createGroqModel('llama-3.1-8b-instant'),
+      });
 
-       const { output } = await titleAgent.run(message, { step });
+      const { output } = await titleAgent.run(message, { step });
 
-       const textMessage = output.find(
+      const textMessage = output.find(
         (m) => m.type === "text" && m.role === "assistant"
       );
 
       if (textMessage?.type === "text") {
-         const title = 
+        const title =
           typeof textMessage.content === "string"
             ? textMessage.content.trim()
-            : textMessage.content
-              .map((c) => c.text)
-              .join("")
-              .trim();
+            : textMessage.content.map((c) => c.text).join("").trim();
 
         if (title) {
           await step.run("update-conversation-title", async () => {
@@ -155,11 +206,9 @@ export const processMessage = inngest.createFunction(
       name: "polaris",
       description: "An expert AI coding assistant",
       system: systemPrompt,
-       model: anthropic({
-        model: "claude-opus-4-20250514",
-        defaultParameters: { temperature: 0.3, max_tokens: 16000 }
-       }),
-       tools: [
+      // Use a model with strong tool-use support
+      model: createGroqModel('llama-3.1-8b-instant'),
+      tools: [
         createListFilesTool({ internalKey, projectId }),
         createReadFilesTool({ internalKey }),
         createUpdateFileTool({ internalKey }),
@@ -168,16 +217,23 @@ export const processMessage = inngest.createFunction(
         createRenameFileTool({ internalKey }),
         createDeleteFilesTool({ internalKey }),
         createScrapeUrlsTool(),
-       ],
+      ],
     });
 
     // Create network with single agent
     const network = createNetwork({
       name: "polaris-network",
       agents: [codingAgent],
-      maxIter: 20,
+      maxIter: 10,
       router: ({ network }) => {
-        const lastResult = network.state.results.at(-1);
+        const results = network.state.results;
+
+        // Always allow at least 2 iterations (one for tool calls, one for response)
+        if (results.length < 2) {
+          return codingAgent;
+        }
+
+        const lastResult = results.at(-1);
         const hasTextResponse = lastResult?.output.some(
           (m) => m.type === "text" && m.role === "assistant"
         );
@@ -185,17 +241,28 @@ export const processMessage = inngest.createFunction(
           (m) => m.type === "tool_call"
         );
 
-        // Anthropic outputs text AND tool calls together
-        // Only stop if there's text WITHOUT tool calls (final response)
+        // If we have a text response and no tool calls, we're done
         if (hasTextResponse && !hasToolCalls) {
           return undefined;
         }
+
+        // Safety: Stop after maxIter to prevent infinite loops
+        if (results.length >= 20) {
+          return undefined;
+        }
+
+        // Otherwise continue
         return codingAgent;
-      }
+      },
     });
 
     // Run the agent
+    console.log("[process-message] Starting agent execution...");
     const result = await network.run(message);
+
+    // Debug: log all results to help trace issues
+    console.log("[process-message] Total iterations:", result.state.results.length);
+    console.log("[process-message] All results:", JSON.stringify(result.state.results.map(r => r.output.map(m => ({ type: m.type, role: m.role, contentLength: typeof (m as any).content === 'string' ? (m as any).content.length : 'array' }))), null, 2));
 
     // Extract the assistant's text response from the last agent result
     const lastResult = result.state.results.at(-1);
@@ -213,16 +280,15 @@ export const processMessage = inngest.createFunction(
           : textMessage.content.map((c) => c.text).join("");
     }
 
-    // Update the assistant message with the response (this also sets status to completed)
+    // Update the assistant message with the response
     await step.run("update-assistant-message", async () => {
       await convex.mutation(api.system.updateMessageContent, {
         internalKey,
         messageId,
         content: assistantResponse,
-      })
+      });
     });
 
     return { success: true, messageId, conversationId };
   }
 );
-
